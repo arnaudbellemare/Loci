@@ -287,7 +287,7 @@ final class LibraryStore {
     var vaultSnapshot: MarkdownVaultSnapshot
     var importJobs: [ImportJobRecord]
     var storageStats: PersistentStoreStats
-    var xBookmarkPayloadsByReferenceID: [ReferenceItem.ID: XBookmarkPayloadSummary]
+    var sourceMetadataByReferenceID: [ReferenceItem.ID: ReferenceSourceMetadata]
 
     private let persistence: LociPersistentStore?
     @ObservationIgnored nonisolated(unsafe) private var vaultWriteWorkItem: DispatchWorkItem?
@@ -298,6 +298,7 @@ final class LibraryStore {
     /// Rolling result of the vault-work chain; only touched on `vaultWriteQueue`.
     @ObservationIgnored nonisolated(unsafe) private var queuedVaultSnapshot: MarkdownVaultSnapshot?
     private var cachedVisibleItems: [VisibleItemsCacheKey: [ReferenceItem]] = [:]
+    private var semanticSearchIDs: Set<ReferenceItem.ID> = []
     private var cachedCounts: [CollectionFilter: Int] = [:]
     private var countsGeneration: UInt64 = 0
     private var mutationCounter: UInt64 = 0
@@ -311,11 +312,13 @@ final class LibraryStore {
     ) {
         self.collections = collections
         var hydratedItems = items
-        let xPayloads = persistence?.loadXBookmarkPayloadsByReferenceID() ?? [:]
+        let sourceMetadata = persistence?.loadReferenceSourceMetadataByReferenceID() ?? [:]
+        let xReferenceIDs = Set(hydratedItems.lazy.filter(\.isXBookmark).map(\.id))
+        let xPayloads = sourceMetadata.filter { id, _ in xReferenceIDs.contains(id) }
         Self.hydrateXBookmarkTitles(in: &hydratedItems, xPayloads: xPayloads, persistence: persistence)
         self.items = hydratedItems
         self.persistence = persistence
-        self.xBookmarkPayloadsByReferenceID = xPayloads
+        self.sourceMetadataByReferenceID = sourceMetadata
         self.importJobs = persistence?.loadSnapshot().importJobs ?? []
         self.storageStats = persistence?.stats() ?? .empty
         self.needsDeferredVaultBootstrap = deferVaultBootstrap
@@ -355,7 +358,7 @@ final class LibraryStore {
             importJobs = persistence.loadRecentImportJobs()
         }
         if changes.xPayloadsChanged {
-            xBookmarkPayloadsByReferenceID = persistence.loadXBookmarkPayloadsByReferenceID()
+            sourceMetadataByReferenceID = persistence.loadReferenceSourceMetadataByReferenceID()
         }
 
         if !changes.referenceIDs.isEmpty {
@@ -367,7 +370,7 @@ final class LibraryStore {
             updatedItems.append(contentsOf: itemsByID.values.sorted { $0.title < $1.title })
             Self.hydrateXBookmarkTitles(
                 in: &updatedItems,
-                xPayloads: xBookmarkPayloadsByReferenceID,
+                xPayloads: currentXBookmarkPayloadsByReferenceID(),
                 persistence: persistence
             )
             items = updatedItems
@@ -376,7 +379,7 @@ final class LibraryStore {
             var updatedItems = items
             Self.hydrateXBookmarkTitles(
                 in: &updatedItems,
-                xPayloads: xBookmarkPayloadsByReferenceID,
+                xPayloads: currentXBookmarkPayloadsByReferenceID(),
                 persistence: persistence
             )
             if updatedItems != items {
@@ -535,11 +538,17 @@ final class LibraryStore {
     }
 
     private func currentXBookmarkPayloadsByReferenceID() -> [UUID: XBookmarkPayloadSummary] {
-        xBookmarkPayloadsByReferenceID
+        let xReferenceIDs = Set(items.lazy.filter(\.isXBookmark).map(\.id))
+        return sourceMetadataByReferenceID.filter { id, _ in xReferenceIDs.contains(id) }
     }
 
     func xBookmarkPayload(for item: ReferenceItem) -> XBookmarkPayloadSummary? {
-        xBookmarkPayloadsByReferenceID[item.id]
+        guard item.isXBookmark else { return nil }
+        return sourceMetadataByReferenceID[item.id]
+    }
+
+    func sourceMetadata(for item: ReferenceItem) -> ReferenceSourceMetadata? {
+        sourceMetadataByReferenceID[item.id]
     }
 
     private func scheduleVaultWrite(for item: ReferenceItem) {
@@ -684,6 +693,14 @@ final class LibraryStore {
         let normalized = normalizedSearchText
         if normalized != activeSearchQuery {
             activeSearchQuery = normalized
+            semanticSearchIDs = Set(
+                SemanticSearch.search(
+                    query: normalized,
+                    in: items.filter { !$0.isTrashed },
+                    metadataByID: sourceMetadataByReferenceID
+                ).map { $0.0.id }
+            )
+            cachedVisibleItems.removeAll(keepingCapacity: true)
         }
     }
 
@@ -713,11 +730,11 @@ final class LibraryStore {
 
         let tokens = Self.searchTokens(from: searchText)
         if !tokens.isEmpty, let persistence, let ftsIDs = persistence.ftsSearch(searchText) {
-            let idSet = Set(ftsIDs)
+            let idSet = Set(ftsIDs).union(semanticSearchIDs)
             return filtered.filter { idSet.contains($0.id) }
         } else if !tokens.isEmpty {
             return filtered.filter {
-                Self.item($0, matchesAllSearchTokens: tokens)
+                semanticSearchIDs.contains($0.id) || Self.item($0, matchesAllSearchTokens: tokens)
             }
         } else {
             return filtered
@@ -1174,7 +1191,7 @@ final class LibraryStore {
                 items[index].group = .link
                 items[index].isInbox = true
                 items[index].aspectRatio = min(items[index].aspectRatio, 0.92)
-                xBookmarkPayloadsByReferenceID[existingID] = XBookmarkPayloadSummary(candidate.payload)
+                sourceMetadataByReferenceID[existingID] = ReferenceSourceMetadata(candidate.payload)
                 if let persistence {
                     persistence.upsert(reference: items[index])
                     persistence.enqueueImportJob(
@@ -1219,7 +1236,7 @@ final class LibraryStore {
             }
 
             insertedItems.append(item)
-            xBookmarkPayloadsByReferenceID[item.id] = XBookmarkPayloadSummary(candidate.payload)
+            sourceMetadataByReferenceID[item.id] = ReferenceSourceMetadata(candidate.payload)
             if let persistence {
                 MarkdownVault.writeRawSourcePackage(
                     for: item,
@@ -1297,7 +1314,10 @@ final class LibraryStore {
             source: payload.source,
             faviconURL: payload.faviconURL,
             ogImageURL: payload.ogImageURL,
-            alsoBookmarkOnX: payload.alsoBookmarkOnX
+            alsoBookmarkOnX: payload.alsoBookmarkOnX,
+            sourceCreatedAt: payload.sourceCreatedAt,
+            mediaCount: payload.mediaCount,
+            mediaTypes: payload.mediaTypes
         )
 
         let importedID = addImportedReference(
@@ -1312,9 +1332,7 @@ final class LibraryStore {
         )
         LociTelemetry.recordImport(source: .browserExtension, count: 1)
 
-        if isXPost {
-            xBookmarkPayloadsByReferenceID[importedID] = XBookmarkPayloadSummary(payloadEnvelope)
-        }
+        sourceMetadataByReferenceID[importedID] = ReferenceSourceMetadata(payloadEnvelope)
         if payload.alsoBookmarkOnX == true, isXPost {
             syncXBookmark(url: normalizedURL)
         }
@@ -1436,7 +1454,9 @@ final class LibraryStore {
     private func attachThumbnail(for itemID: ReferenceItem.ID, from fileURL: URL) {
         Task { [weak self] in
             guard let self else { return }
-            let downsampledPNGData = await LociImageLoader.pngData(from: fileURL, maxPixelSize: 720)
+            let downsampledPNGData = VideoPosterFrameSelector.supports(fileExtension: fileURL.pathExtension)
+                ? await VideoPosterFrameSelector.pngData(for: fileURL, maxPixelSize: 1_600)
+                : await LociImageLoader.pngData(from: fileURL, maxPixelSize: 1_600)
             let thumbnailPNGData: Data?
             if let downsampledPNGData {
                 thumbnailPNGData = downsampledPNGData
@@ -1457,13 +1477,20 @@ final class LibraryStore {
     private func applyThumbnailPath(_ path: String, to itemID: ReferenceItem.ID) {
         guard let index = items.firstIndex(where: { $0.id == itemID }) else { return }
         items[index].thumbnailPath = path
+        if let thumbnailURL = persistence?.thumbnailsURL.appendingPathComponent(path),
+           let ratio = LociImageLoader.imageAspectRatio(from: thumbnailURL),
+           ratio.isFinite,
+           ratio > 0.05 {
+            items[index].aspectRatio = ratio
+            persistence?.upsert(reference: items[index], recordsHistory: false)
+        }
         invalidateVisibleItems()
     }
 
     nonisolated static func quickLookThumbnailPNGData(for fileURL: URL) async -> Data? {
         let request = QLThumbnailGenerator.Request(
             fileAt: fileURL,
-            size: CGSize(width: 720, height: 720),
+            size: CGSize(width: 1_600, height: 1_600),
             scale: await MainActor.run { NSScreen.main?.backingScaleFactor ?? 2 },
             representationTypes: .all
         )
@@ -2183,7 +2210,10 @@ actor ImportCoordinator {
         let refID = job.referenceID
 
         var generatedThumbnailPath: String?
-        if let refID, let pngData = await LociImageLoader.pngData(from: fileURL, maxPixelSize: 600) {
+        let primaryPreviewData = VideoPosterFrameSelector.supports(fileExtension: fileURL.pathExtension)
+            ? await VideoPosterFrameSelector.pngData(for: fileURL, maxPixelSize: 1_600)
+            : await LociImageLoader.pngData(from: fileURL, maxPixelSize: 1_600)
+        if let refID, let pngData = primaryPreviewData {
             generatedThumbnailPath = await MainActor.run { () -> String? in
                 if let thumbURL = persistence.writeThumbnailPNGData(pngData, for: refID) {
                     let path = thumbURL.lastPathComponent
@@ -2486,7 +2516,10 @@ actor ImportCoordinator {
         }
 
         if generatedThumbnailPath == nil && response.mimeType?.localizedCaseInsensitiveContains("html") != true {
-            if let pngData = await LociImageLoader.pngData(from: managedURL, maxPixelSize: 600) {
+            let previewData = VideoPosterFrameSelector.supports(fileExtension: managedURL.pathExtension)
+                ? await VideoPosterFrameSelector.pngData(for: managedURL, maxPixelSize: 1_600)
+                : await LociImageLoader.pngData(from: managedURL, maxPixelSize: 1_600)
+            if let pngData = previewData {
                 generatedThumbnailPath = await MainActor.run { () -> String? in
                     if let thumbURL = persistence.writeThumbnailPNGData(pngData, for: refID) {
                         let path = thumbURL.lastPathComponent
@@ -2579,12 +2612,12 @@ actor ImportCoordinator {
         request.timeoutInterval = 12
         request.setValue("image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8", forHTTPHeaderField: "Accept")
         guard let (data, response) = try? await URLSession.shared.data(for: request),
-              data.count <= 8 * 1_024 * 1_024,
+              data.count <= 16 * 1_024 * 1_024,
               let httpResponse = response as? HTTPURLResponse,
               (200..<300).contains(httpResponse.statusCode) else {
             return nil
         }
-        if let pngData = LociImageLoader.pngData(from: data, maxPixelSize: 1200) {
+        if let pngData = LociImageLoader.pngData(from: data, maxPixelSize: 1_600) {
             return pngData
         }
         return data

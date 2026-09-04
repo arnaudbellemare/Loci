@@ -151,7 +151,7 @@ struct BrowserExtensionReferencePayload: Codable, Hashable {
 /// Compact, UI-facing projection of an extension payload. Raw import jobs keep
 /// the complete HTML/transcript for extraction, while the long-lived library
 /// model retains only card, graph, and media metadata plus bounded text.
-struct XBookmarkPayloadSummary: Hashable, Sendable {
+struct ReferenceSourceMetadata: Hashable, Sendable {
     var url: String?
     var title: String?
     var note: String?
@@ -187,6 +187,10 @@ struct XBookmarkPayloadSummary: Hashable, Sendable {
         return String(value.prefix(limit))
     }
 }
+
+/// Compatibility name for graph and X-specific helpers while callers migrate
+/// to the source-neutral metadata model.
+typealias XBookmarkPayloadSummary = ReferenceSourceMetadata
 
 private struct AskVaultPayload: Codable {
     var question: String

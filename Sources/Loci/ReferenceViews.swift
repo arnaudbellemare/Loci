@@ -9,6 +9,42 @@ private func withDirectManipulation(_ updates: () -> Void) {
     }
 }
 
+enum ReferencePreviewMotion {
+    static let coordinateSpace = "loci-reference-preview-space"
+}
+
+private struct ReferencePreviewSourceFrameModifier: ViewModifier {
+    let itemID: ReferenceItem.ID
+    let isEnabled: Bool
+
+    func body(content: Content) -> some View {
+        content.background {
+            if isEnabled {
+                GeometryReader { proxy in
+                    Color.clear.preference(
+                        key: ReferencePreviewSourceFrameKey.self,
+                        value: [itemID: proxy.frame(in: .named(ReferencePreviewMotion.coordinateSpace))]
+                    )
+                }
+            }
+        }
+    }
+}
+
+extension View {
+    func referencePreviewSourceFrame(for itemID: ReferenceItem.ID, isEnabled: Bool) -> some View {
+        modifier(ReferencePreviewSourceFrameModifier(itemID: itemID, isEnabled: isEnabled))
+    }
+}
+
+struct ReferencePreviewSourceFrameKey: PreferenceKey {
+    static let defaultValue: [ReferenceItem.ID: CGRect] = [:]
+
+    static func reduce(value: inout [ReferenceItem.ID: CGRect], nextValue: () -> [ReferenceItem.ID: CGRect]) {
+        value.merge(nextValue(), uniquingKeysWith: { _, newest in newest })
+    }
+}
+
 struct ReferenceGridView: View {
     @Bindable var store: LibraryStore
     let namespace: Namespace.ID
@@ -22,7 +58,6 @@ struct ReferenceGridView: View {
     @State private var pendingPreviewID: ReferenceItem.ID?
     private static let initialBatchSize = 144
     private static let batchSize = 360
-    private static let previewOpenDelay: TimeInterval = 0.012
 
     var body: some View {
         GeometryReader { proxy in
@@ -82,7 +117,7 @@ struct ReferenceGridView: View {
             }
         }
         .background(LociColor.canvas)
-        .animation(AppMotion.smooth, value: store.selectedFilter)
+        .animation(AppMotion.collectionChange, value: store.selectedFilter)
         .animation(AppMotion.smooth, value: store.activeSearchQuery)
         .gesture(
             MagnifyGesture()
@@ -123,7 +158,7 @@ struct ReferenceGridView: View {
             if store.focusedItemID != nil {
                 store.requestFocusDismissal()
             } else if let selectedID = store.selectedItemIDs.first, let item = store.items.first(where: { $0.id == selectedID }) {
-                withAnimation(AppMotion.hero) { store.focus(item) }
+                withAnimation(AppMotion.referenceOpen) { store.focus(item) }
             }
             return .handled
         }
@@ -151,15 +186,16 @@ struct ReferenceGridView: View {
             store.select(item)
         }
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + Self.previewOpenDelay) {
+        // Focus on the next run-loop pass so the selection can publish its source frame.
+        // InlineFocusStage waits on actual frame availability and owns the bounded fallback.
+        DispatchQueue.main.async {
             guard pendingPreviewID == previewID,
                   store.selectedItemIDs == [previewID],
                   store.focusedItemID != previewID else { return }
 
             pendingPreviewID = nil
-            clickRipple = nil
 
-            withAnimation(AppMotion.hero) {
+            withAnimation(AppMotion.referenceOpen) {
                 store.openPreview(item)
             }
         }
@@ -174,19 +210,12 @@ struct ReferenceGridView: View {
         let item = placement.item
         let tileCenter = CGPoint(x: placement.frame.midX, y: placement.frame.midY)
         let isPreviewActive = store.focusedItemID != nil
-        let isFocusedItem = store.focusedItemID == item.id
-        let focusOffset = focusSpreadOffset(for: placement, in: placements)
 
         ReferenceGridTile(
             item: item,
-            xBookmarkPayload: store.xBookmarkPayload(for: item),
+            sourceMetadata: store.sourceMetadata(for: item),
             isSelected: !isPreviewActive && store.selectedItemIDs.contains(item.id),
             clickRippleStrength: isPreviewActive ? 0 : clickRippleStrength(for: item.id, ripple: clickRipple)
-        )
-        .focusMatchedGeometry(
-            id: item.id,
-            namespace: namespace,
-            isSource: isActive && store.focusedItemID != item.id
         )
         .frame(width: placement.frame.width, height: placement.frame.height)
         .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
@@ -236,11 +265,12 @@ struct ReferenceGridView: View {
         .accessibilityAction { handleTap(for: item) }
         .position(x: placement.frame.midX, y: placement.frame.midY - yOffset)
         .offset(referenceClickRippleOffset(for: item.id, ripple: clickRipple))
-        .offset(focusOffset)
-        .opacity(isFocusedItem ? 0 : (isPreviewActive ? 0.58 : 1))
-        .scaleEffect(isPreviewActive && !isFocusedItem ? 0.985 : 1)
-        .animation(AppMotion.hero, value: store.focusedItemID)
-        .zIndex(item.id == store.focusedItemID ? 8 : 0)
+        .referencePreviewSourceFrame(for: item.id, isEnabled: store.selectedItemIDs.contains(item.id))
+        // Keep the source tile in place. The focused layer is centered and the backdrop provides
+        // separation. The selected tile is replaced by the explicit hero overlay.
+        .opacity(store.focusedItemID == item.id ? 0 : (isPreviewActive ? 0.72 : 1))
+        .scaleEffect(isPreviewActive && store.focusedItemID != item.id ? 0.992 : 1)
+        .animation(isPreviewActive ? AppMotion.referenceOpen : AppMotion.referenceClose, value: store.focusedItemID)
     }
 
     private func dismissFocusedPreviewOrClearSelection() {
@@ -256,33 +286,6 @@ struct ReferenceGridView: View {
         }
     }
 
-    private func focusSpreadOffset(
-        for placement: ReferenceGridPlacement,
-        in placements: [ReferenceGridPlacement]
-    ) -> CGSize {
-        guard let focusedID = store.focusedItemID,
-              focusedID != placement.item.id,
-              let focusedPlacement = placements.first(where: { $0.item.id == focusedID }) else {
-            return .zero
-        }
-
-        let dx = placement.frame.midX - focusedPlacement.frame.midX
-        let dy = placement.frame.midY - focusedPlacement.frame.midY
-        let distanceSquared = dx * dx + dy * dy
-        guard distanceSquared > 1 else { return .zero }
-
-        let distance = sqrt(distanceSquared)
-        let reach: CGFloat = 440
-        guard distance < reach else { return .zero }
-
-        let normalizedDistance = min(1, distance / reach)
-        let falloff = pow(max(0, 1 - normalizedDistance), 2.1)
-        let push = 34 * falloff
-        guard push > 0.35 else { return .zero }
-
-        return CGSize(width: dx / distance * push, height: dy / distance * push)
-    }
-
     private enum GridDirection { case left, right, up, down }
 
     private func moveGridSelection(direction: GridDirection) -> KeyPress.Result {
@@ -290,6 +293,7 @@ struct ReferenceGridView: View {
         guard !visible.isEmpty else { return .ignored }
 
         if store.focusedItemID != nil {
+            guard !store.focusIsDismissing else { return .handled }
             guard direction == .left || direction == .right else { return .handled }
             let offset = direction == .left ? -1 : 1
             withAnimation(AppMotion.smooth) {
@@ -322,10 +326,10 @@ struct ReferenceGridView: View {
 
     private func gridPanelInsets(for size: CGSize) -> EdgeInsets {
         EdgeInsets(
-            top: 72,
-            leading: size.width > 900 ? 26 : 18,
+            top: 154,
+            leading: size.width > 900 ? 20 : 14,
             bottom: 74,
-            trailing: size.width > 900 ? 28 : 18
+            trailing: size.width > 900 ? 20 : 14
         )
     }
 
@@ -368,8 +372,8 @@ struct ReferenceGridView: View {
 
     private func gridPlacements(for items: [ReferenceItem], in width: CGFloat) -> [ReferenceGridPlacement] {
         let progress = max(0, min(1, (store.gridZoom - 0.40) / 0.60))
-        let spacing = 14 - progress * 3
-        let targetColumnWidth = 132 + progress * 126
+        let spacing = 18 + progress * 12
+        let targetColumnWidth = 136 + progress * 92
         let rawColumnCount = Int((width + spacing) / (targetColumnWidth + spacing))
         let columnCount = min(8, max(width < 560 ? 2 : 3, rawColumnCount))
         let columnWidth = floor((width - CGFloat(columnCount - 1) * spacing) / CGFloat(columnCount))
@@ -470,24 +474,8 @@ struct ReferenceGridView: View {
     }
 
     private func gridHeight(for item: ReferenceItem, aspectRatio: CGFloat, width: CGFloat) -> CGFloat {
-        if item.isXBookmark {
-            return width * 0.96
-        }
-
         let naturalHeight = width / max(0.1, aspectRatio)
-
-        switch item.kind {
-        case .phone:
-            return min(max(naturalHeight, width * 1.25), width * 2.08)
-        case .website, .laptop:
-            return min(max(naturalHeight, width * 0.46), width * 0.72)
-        case .app:
-            return min(max(naturalHeight, width * 0.52), width * 0.86)
-        case .product:
-            return min(max(naturalHeight, width * 0.58), width * 1.12)
-        case .typography:
-            return min(max(naturalHeight, width * 0.64), width * 1.18)
-        }
+        return min(max(naturalHeight, width * 0.38), width * 2.40)
     }
 
 }
@@ -542,16 +530,11 @@ struct ReferenceCanvasView: View {
                         let itemPoint = canvasPoint(for: item, in: proxy.size)
                         ReferenceTile(
                             item: item,
-                            xBookmarkPayload: store.xBookmarkPayload(for: item),
+                            sourceMetadata: store.sourceMetadata(for: item),
                             isSelected: store.focusedItemID == nil && store.selectedItemIDs.contains(item.id),
                             showsTitle: false,
                             namespace: namespace,
                             clickRippleStrength: store.focusedItemID == nil ? clickRippleStrength(for: item.id, ripple: clickRipple) : 0
-                        )
-                        .focusMatchedGeometry(
-                            id: item.id,
-                            namespace: namespace,
-                            isSource: isActive && store.focusedItemID != item.id
                         )
                         .frame(width: itemSize.width, height: itemSize.height)
                         .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
@@ -568,7 +551,9 @@ struct ReferenceCanvasView: View {
                         .accessibilityAction { openCanvasItem(item) }
                         .position(itemPoint)
                         .offset(referenceClickRippleOffset(for: item.id, ripple: clickRipple))
-                        .opacity(store.focusedItemID == item.id ? 0 : 1)
+                        .referencePreviewSourceFrame(for: item.id, isEnabled: store.selectedItemIDs.contains(item.id))
+                        .opacity(store.focusedItemID == nil ? 1 : 0.72)
+                        .animation(store.focusedItemID == nil ? AppMotion.referenceClose : AppMotion.referenceOpen, value: store.focusedItemID)
                         .zIndex(store.selectedItemIDs.contains(item.id) || activeCanvasDragIDs.contains(item.id) ? 6 : 0)
                         .transaction { transaction in
                             if activeCanvasDragIDs.contains(item.id) {
@@ -751,11 +736,17 @@ struct ReferenceCanvasView: View {
     private func openCanvasItem(_ item: ReferenceItem) {
         clickRipple = nil
 
-        withAnimation(AppMotion.hero) {
-            if store.focusedItemID == item.id {
-                store.clearFocus()
-            } else {
-                store.focus(item)
+        if store.focusedItemID == item.id {
+            store.requestFocusDismissal()
+        } else {
+            withAnimation(AppMotion.selection) {
+                store.select(item)
+            }
+            DispatchQueue.main.async {
+                guard store.selectedItemIDs == [item.id], store.focusedItemID == nil else { return }
+                withAnimation(AppMotion.referenceOpen) {
+                    store.focus(item)
+                }
             }
         }
     }
@@ -901,37 +892,34 @@ struct ReferenceInfinityView: View {
                         let itemSize = infinitySize(for: item)
                         ReferenceTile(
                             item: item,
-                            xBookmarkPayload: store.xBookmarkPayload(for: item),
+                            sourceMetadata: store.sourceMetadata(for: item),
                             isSelected: store.focusedItemID == nil && store.selectedItemIDs.contains(item.id),
                             showsTitle: false,
                             namespace: namespace,
                             clickRippleStrength: store.focusedItemID == nil ? clickRippleStrength(for: item.id, ripple: clickRipple) : 0
                         )
-                            .focusMatchedGeometry(
-                                id: item.id,
-                                namespace: namespace,
-                                isSource: isActive && store.focusedItemID != item.id
-                            )
                             .frame(width: itemSize.width, height: itemSize.height)
                             .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
                             .referenceContextMenu(item: item, store: store)
                             .simultaneousGesture(itemDragGesture(for: item))
                             .highPriorityGesture(
                                 TapGesture().onEnded {
-                                    withAnimation(AppMotion.hero) {
+                                    withAnimation(AppMotion.referenceOpen) {
                                         focusInfinityItem(item)
                                     }
                                 }
                             )
                             .accessibilityAddTraits(.isButton)
                             .accessibilityAction {
-                                withAnimation(AppMotion.hero) {
+                                withAnimation(AppMotion.referenceOpen) {
                                     focusInfinityItem(item)
                                 }
                             }
                             .position(itemPosition)
                             .offset(referenceClickRippleOffset(for: item.id, ripple: clickRipple))
-                            .opacity(store.focusedItemID == item.id ? 0 : infinityOpacity(for: item))
+                            .referencePreviewSourceFrame(for: item.id, isEnabled: store.selectedItemIDs.contains(item.id))
+                            .opacity((store.focusedItemID == nil ? 1 : 0.72) * infinityOpacity(for: item))
+                            .animation(store.focusedItemID == nil ? AppMotion.referenceClose : AppMotion.referenceOpen, value: store.focusedItemID)
                             .zIndex(store.selectedItemIDs.contains(item.id) || store.focusedItemID == item.id ? 8 : 1)
                     }
                 }
@@ -997,10 +985,16 @@ struct ReferenceInfinityView: View {
         }
 
         if store.focusedItemID == item.id {
-            store.clearFocus()
+            store.requestFocusDismissal()
         } else {
             expandedInfinityGroup = item.group
-            store.focus(item)
+            store.select(item)
+            DispatchQueue.main.async {
+                guard store.selectedItemIDs == [item.id], store.focusedItemID == nil else { return }
+                withAnimation(AppMotion.referenceOpen) {
+                    store.focus(item)
+                }
+            }
         }
     }
 
@@ -1579,18 +1573,18 @@ private struct ReferenceClickRipple {
 }
 
 private enum ReferenceClickRippleTuning {
-    static let gridScatterMagnitude: CGFloat = 12
-    static let gridReach: CGFloat = 220
+    static let gridScatterMagnitude: CGFloat = 7
+    static let gridReach: CGFloat = 260
     static let canvasScatterMagnitude: CGFloat = 12
     static let canvasReach: CGFloat = 190
     static let infinityScatterMagnitude: CGFloat = 13
     static let infinityReach: CGFloat = 210
-    static let falloffPower: CGFloat = 3.15
-    static let sourcePulseScale: CGFloat = 0.006
-    static let settleDelay: TimeInterval = 0.045
-    static let cleanupDelay: TimeInterval = 0.20
-    static let scatterOut = Animation.spring(response: 0.085, dampingFraction: 0.90)
-    static let settleBack = Animation.spring(response: 0.14, dampingFraction: 0.97)
+    static let falloffPower: CGFloat = 2.6
+    static let sourcePulseScale: CGFloat = 0.010
+    static let settleDelay: TimeInterval = 0.078
+    static let cleanupDelay: TimeInterval = 0.30
+    static let scatterOut = Animation.spring(response: 0.15, dampingFraction: 0.86)
+    static let settleBack = Animation.spring(response: 0.22, dampingFraction: 0.94)
 }
 
 private func startReferenceClickRipple(
@@ -1660,24 +1654,20 @@ private func clickRippleStrength(for itemID: ReferenceItem.ID, ripple: Reference
 
 struct ReferenceGridTile: View {
     var item: ReferenceItem
-    var xBookmarkPayload: XBookmarkPayloadSummary? = nil
+    var sourceMetadata: ReferenceSourceMetadata? = nil
     var isSelected: Bool
     var clickRippleStrength: CGFloat = 0
     @State private var isHovering = false
     private let selectionBlue = LociColor.accent
 
     var body: some View {
-        ReferenceThumbnail(item: item, xBookmarkPayload: xBookmarkPayload)
+        ReferenceThumbnail(item: item, sourceMetadata: sourceMetadata)
             .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-            .background {
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .fill(LociColor.surface.opacity(0.96))
-            }
             .overlay {
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
                     .strokeBorder(
-                        isSelected ? selectionBlue : LociColor.hairline.opacity(isHovering ? 0.85 : 0.45),
-                        lineWidth: isSelected ? 2.2 : 0.6
+                        isSelected ? selectionBlue : LociColor.hairline.opacity(isHovering ? 0.72 : 0),
+                        lineWidth: isSelected ? 2.2 : 0.7
                     )
             }
             .overlay(alignment: .topTrailing) {
@@ -1691,12 +1681,12 @@ struct ReferenceGridTile: View {
                 }
             }
             .shadow(
-                color: isSelected ? selectionBlue.opacity(0.18) : .black.opacity(isHovering ? 0.075 : 0.050),
-                radius: isSelected ? 10 : (isHovering ? 7 : 4),
+                color: isSelected ? selectionBlue.opacity(0.18) : .black.opacity(isHovering ? 0.10 : 0),
+                radius: isSelected ? 10 : (isHovering ? 9 : 0),
                 x: 0,
-                y: isSelected ? 4 : (isHovering ? 3 : 2)
+                y: isSelected ? 4 : (isHovering ? 5 : 0)
             )
-            .scaleEffect((isSelected ? 1.012 : (isHovering ? 1.006 : 1)) + ReferenceClickRippleTuning.sourcePulseScale * clickRippleStrength)
+            .scaleEffect((isSelected ? 1.008 : (isHovering ? 1.004 : 1)) + ReferenceClickRippleTuning.sourcePulseScale * clickRippleStrength)
             .animation(AppMotion.hover, value: isHovering)
             .animation(AppMotion.snappy, value: isSelected)
             .onHover { isHovering = $0 }
@@ -1707,7 +1697,7 @@ struct ReferenceGridTile: View {
 
 struct ReferenceTile: View {
     var item: ReferenceItem
-    var xBookmarkPayload: XBookmarkPayloadSummary? = nil
+    var sourceMetadata: ReferenceSourceMetadata? = nil
     var isSelected: Bool
     var showsTitle: Bool
     let namespace: Namespace.ID
@@ -1717,7 +1707,7 @@ struct ReferenceTile: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
-            ReferenceThumbnail(item: item, xBookmarkPayload: xBookmarkPayload)
+            ReferenceThumbnail(item: item, sourceMetadata: sourceMetadata)
                 .aspectRatio(item.aspectRatio, contentMode: .fit)
                 .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
                 .overlay {
@@ -1767,11 +1757,17 @@ private struct ReferenceContextMenuModifier: ViewModifier {
     func body(content: Content) -> some View {
         content.contextMenu {
             Button {
-                withAnimation(AppMotion.hero) {
-                    if store.focusedItemID == item.id {
-                        store.clearFocus()
-                    } else {
-                        store.focus(item)
+                if store.focusedItemID == item.id {
+                    store.requestFocusDismissal()
+                } else {
+                    withAnimation(AppMotion.selection) {
+                        store.select(item)
+                    }
+                    DispatchQueue.main.async {
+                        guard store.selectedItemIDs == [item.id], store.focusedItemID == nil else { return }
+                        withAnimation(AppMotion.referenceOpen) {
+                            store.focus(item)
+                        }
                     }
                 }
             } label: {
@@ -1929,10 +1925,6 @@ private struct ReferenceContextMenuModifier: ViewModifier {
 }
 
 private extension View {
-    func focusMatchedGeometry(id: ReferenceItem.ID, namespace: Namespace.ID, isSource: Bool) -> some View {
-        matchedGeometryEffect(id: id, in: namespace, isSource: isSource)
-    }
-
     func referenceContextMenu(item: ReferenceItem, store: LibraryStore) -> some View {
         modifier(ReferenceContextMenuModifier(item: item, store: store))
     }
