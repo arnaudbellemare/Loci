@@ -33,7 +33,7 @@ struct VisualFeaturePrint: Hashable {
 
 @MainActor
 enum VisualSearch {
-    static func computeFeaturePrint(for imageURL: URL) async -> VisualFeaturePrint? {
+    static func computeFeaturePrint(for imageURL: URL, referenceID: UUID = UUID()) async -> VisualFeaturePrint? {
         guard let cgImage = await LociImageLoader.downsampledCGImage(from: imageURL, maxPixelSize: 1024) else {
             return nil
         }
@@ -48,7 +48,7 @@ enum VisualSearch {
                     }
                     let featureData = observation.data as Data
                     continuation.resume(returning: VisualFeaturePrint(
-                        referenceID: UUID(),
+                        referenceID: referenceID,
                         featureData: featureData
                     ))
                 }
@@ -68,8 +68,8 @@ enum VisualSearch {
         let persistence = LociPersistentStore.shared
 
         let candidates = items.compactMap { item -> (UUID, URL)? in
-            guard let fileURL = persistence?.originalsURL.appendingPathComponent(item.fileName),
-                  FileManager.default.fileExists(atPath: fileURL.path) else { return nil }
+            guard let persistence,
+                  let fileURL = visualURL(for: item, persistence: persistence) else { return nil }
             return (item.id, fileURL)
         }
         let maxConcurrent = min(max(ProcessInfo.processInfo.activeProcessorCount - 1, 2), 6)
@@ -82,7 +82,7 @@ enum VisualSearch {
                 let candidate = candidates[nextIndex]
                 nextIndex += 1
                 group.addTask {
-                    let print = await computeFeaturePrint(for: candidate.1)
+                    let print = await computeFeaturePrint(for: candidate.1, referenceID: candidate.0)
                     return (candidate.0, print)
                 }
             }
@@ -136,5 +136,32 @@ enum VisualSearch {
             guard let item = allItems.first(where: { $0.id == id }) else { return nil }
             return (item, similarity)
         }
+    }
+
+    static func relatedItems(
+        to item: ReferenceItem,
+        in allItems: [ReferenceItem],
+        threshold: Double = 0.42,
+        maxResults: Int = 12
+    ) async -> [(ReferenceItem, Double)] {
+        let prints = await computeFeaturePrints(for: allItems)
+        guard let target = prints[item.id] else { return [] }
+        let matches = findSimilar(to: target, in: prints, threshold: threshold, maxResults: maxResults)
+        let itemsByID = Dictionary(uniqueKeysWithValues: allItems.map { ($0.id, $0) })
+        return matches.compactMap { id, similarity in
+            itemsByID[id].map { ($0, similarity) }
+        }
+    }
+
+    private static func visualURL(for item: ReferenceItem, persistence: LociPersistentStore) -> URL? {
+        if let thumbnailPath = item.thumbnailPath {
+            let thumbnailURL = persistence.thumbnailsURL.appendingPathComponent(thumbnailPath)
+            if FileManager.default.fileExists(atPath: thumbnailURL.path) {
+                return thumbnailURL
+            }
+        }
+        let originalURL = persistence.originalsURL.appendingPathComponent(item.fileName)
+        guard FileManager.default.fileExists(atPath: originalURL.path) else { return nil }
+        return originalURL
     }
 }

@@ -105,12 +105,30 @@ struct FileSystemWorkspaceView: View {
         .focusable()
         .focused($isKeyboardFocused)
         .focusEffectDisabled()
-        .onKeyPress(.upArrow) { moveSelection(by: -1) }
-        .onKeyPress(.downArrow) { moveSelection(by: 1) }
-        .onKeyPress(.leftArrow) { keyboardBack() }
-        .onKeyPress(.rightArrow) { keyboardForward() }
-        .onKeyPress(.return) { openSelected() }
-        .onKeyPress(.space) { openSelected() }
+        .onKeyPress(.upArrow) {
+            guard store.focusedItemID == nil else { return .handled }
+            return moveSelection(by: -1)
+        }
+        .onKeyPress(.downArrow) {
+            guard store.focusedItemID == nil else { return .handled }
+            return moveSelection(by: 1)
+        }
+        .onKeyPress(.leftArrow) {
+            guard store.focusedItemID == nil else { return .ignored }
+            return keyboardBack()
+        }
+        .onKeyPress(.rightArrow) {
+            guard store.focusedItemID == nil else { return .ignored }
+            return keyboardForward()
+        }
+        .onKeyPress(.return) {
+            guard store.focusedItemID == nil else { return .handled }
+            return openSelected()
+        }
+        .onKeyPress(.space) {
+            guard store.focusedItemID == nil else { return .handled }
+            return openSelected()
+        }
         .background(LociColor.surface)
         .onAppear {
             isKeyboardFocused = true
@@ -647,10 +665,12 @@ struct FileSystemWorkspaceView: View {
             if compact {
                 thumbnail(item, width: nil, height: 156, cornerRadius: 10)
                     .frame(maxWidth: .infinity)
+                    .referencePreviewSourceFrame(for: item.id, isEnabled: store.selectedItemIDs.contains(item.id))
                     .padding(.top, 14)
             } else {
                 thumbnail(item, width: nil, height: 290, cornerRadius: 10)
                     .frame(maxWidth: .infinity)
+                    .referencePreviewSourceFrame(for: item.id, isEnabled: store.selectedItemIDs.contains(item.id))
                     .padding(.top, 22)
             }
 
@@ -811,7 +831,7 @@ struct FileSystemWorkspaceView: View {
     }
 
     private func thumbnail(_ item: ReferenceItem, width: CGFloat?, height: CGFloat, cornerRadius: CGFloat) -> some View {
-        ReferenceThumbnail(item: item)
+        ReferenceThumbnail(item: item, sourceMetadata: store.sourceMetadata(for: item))
             .frame(width: width, height: height)
             .frame(maxWidth: width == nil ? .infinity : nil)
             .fixedSize(horizontal: width != nil, vertical: true)
@@ -918,7 +938,7 @@ struct FileSystemWorkspaceView: View {
     }
 
     private func selectItem(_ item: ReferenceItem) {
-        withAnimation(AppMotion.instant) {
+        withAnimation(AppMotion.selection) {
             selectedItemID = item.id
             store.select(item)
             isKeyboardFocused = true
@@ -926,8 +946,10 @@ struct FileSystemWorkspaceView: View {
     }
 
     private func openPreview(_ item: ReferenceItem) {
-        withAnimation(AppMotion.smooth) {
-            selectItem(item)
+        withAnimation(AppMotion.referenceOpen) {
+            selectedItemID = item.id
+            store.select(item)
+            isKeyboardFocused = true
             store.openPreview(item)
         }
     }

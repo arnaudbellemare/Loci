@@ -105,6 +105,7 @@ struct LociShell: View {
             .focusable()
             .onKeyPress(.leftArrow) {
                 guard store.focusedItemID != nil else { return .ignored }
+                guard !store.focusIsDismissing else { return .handled }
                 withAnimation(AppMotion.smooth) {
                     _ = store.focusAdjacentVisibleItem(offset: -1)
                 }
@@ -112,6 +113,7 @@ struct LociShell: View {
             }
             .onKeyPress(.rightArrow) {
                 guard store.focusedItemID != nil else { return .ignored }
+                guard !store.focusIsDismissing else { return .handled }
                 withAnimation(AppMotion.smooth) {
                     _ = store.focusAdjacentVisibleItem(offset: 1)
                 }
@@ -178,16 +180,17 @@ struct LociShell: View {
         if showsReferenceChrome {
             LociTitle(store: store)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-                .padding(.top, 22)
+                .padding(.top, 74)
+                .padding(.leading, 164)
 
             BottomModeBar(store: store)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
                 .padding(.bottom, 20)
 
             UtilityCluster(store: store)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
                 .padding(.trailing, 18)
-                .padding(.bottom, 21)
+                .padding(.top, 20)
         }
 
         if showsReferenceChrome && !store.selectedItemIDs.isEmpty && store.selectedFilter != .trash {
@@ -199,8 +202,8 @@ struct LociShell: View {
 
         if showsReferenceChrome && store.mode == .grid {
             ZoomSlider(store: store)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
-                .padding(.top, 22)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
+                .padding(.bottom, 62)
                 .padding(.trailing, 18)
         }
     }
@@ -339,34 +342,38 @@ struct MainReferencePane: View {
     let namespace: Namespace.ID
     @Environment(\.undoManager) private var undoManager
     @State private var warmedModes: [ViewMode] = []
+    @State private var previewSourceFrames: [ReferenceItem.ID: CGRect] = [:]
 
     var body: some View {
         ZStack {
             if shouldRenderMode(.grid) {
                 ReferenceGridView(store: store, namespace: namespace, isActive: store.mode == .grid)
                     .opacity(store.mode == .grid ? 1 : 0)
+                    .scaleEffect(store.mode == .grid ? 1 : 0.995)
                     .allowsHitTesting(store.mode == .grid)
                     .accessibilityHidden(store.mode != .grid)
                     .zIndex(store.mode == .grid ? 3 : 0)
-                    .animation(nil, value: store.mode)
+                    .animation(AppMotion.modeSwitch, value: store.mode)
             }
 
             if shouldRenderMode(.canvas) {
                 ReferenceCanvasView(store: store, namespace: namespace, isActive: store.mode == .canvas)
                     .opacity(store.mode == .canvas ? 1 : 0)
+                    .scaleEffect(store.mode == .canvas ? 1 : 0.995)
                     .allowsHitTesting(store.mode == .canvas)
                     .accessibilityHidden(store.mode != .canvas)
                     .zIndex(store.mode == .canvas ? 3 : 0)
-                    .animation(nil, value: store.mode)
+                    .animation(AppMotion.modeSwitch, value: store.mode)
             }
 
             if shouldRenderMode(.infinity) {
                 ReferenceInfinityView(store: store, namespace: namespace, isActive: store.mode == .infinity)
                     .opacity(store.mode == .infinity ? 1 : 0)
+                    .scaleEffect(store.mode == .infinity ? 1 : 0.995)
                     .allowsHitTesting(store.mode == .infinity)
                     .accessibilityHidden(store.mode != .infinity)
                     .zIndex(store.mode == .infinity ? 3 : 0)
-                    .animation(nil, value: store.mode)
+                    .animation(AppMotion.modeSwitch, value: store.mode)
             }
 
             if store.selectedFilter == .api {
@@ -433,14 +440,19 @@ struct MainReferencePane: View {
             }
 
             if let focusedItem = store.focusedItem {
-                InlineFocusStage(item: focusedItem, store: store, namespace: namespace)
-                    .transition(.asymmetric(
-                        insertion: AppMotion.previewTransition.animation(AppMotion.hero),
-                        removal: .identity
-                    ))
+                InlineFocusStage(
+                    item: focusedItem,
+                    store: store,
+                    sourceFrame: previewSourceFrames[focusedItem.id]
+                )
+                    // InlineFocusStage owns its backdrop/content phases. A second transition here
+                    // would multiply opacity and make the preview appear to fly or blink.
+                    .transition(.identity)
                     .zIndex(20)
             }
         }
+        .coordinateSpace(name: ReferencePreviewMotion.coordinateSpace)
+        .onPreferenceChange(ReferencePreviewSourceFrameKey.self) { previewSourceFrames = $0 }
         .background(LociColor.surface)
         .contentShape(Rectangle())
         .contextMenu {
@@ -622,13 +634,23 @@ struct ReferenceEmptyStateView: View {
 struct InlineFocusStage: View {
     var item: ReferenceItem
     @Bindable var store: LibraryStore
-    let namespace: Namespace.ID
+    var sourceFrame: CGRect?
 
     @State private var pageIndex = 0
-    @State private var showsDetails = false
     @State private var previewVisible = false
+    @State private var backdropVisible = false
     @State private var chromeVisible = false
     @State private var isDismissing = false
+    @State private var heroVisible = false
+    @State private var heroExpanded = false
+    @State private var capturedSourceFrame: CGRect?
+    @State private var presentationHasCommitted = false
+    @State private var dismissalTask: Task<Void, Never>?
+
+    private struct PresentationTaskID: Equatable {
+        let itemID: ReferenceItem.ID
+        let hasSourceFrame: Bool
+    }
 
     private static let imageExtensions: Set<String> = [
         "png", "jpg", "jpeg", "gif", "webp", "heic", "tif", "tiff", "bmp", "svg"
@@ -642,20 +664,30 @@ struct InlineFocusStage: View {
         item.kind == .website || item.fileExtension == "webloc" || item.websiteURL != nil
     }
 
+    private var isSocialReference: Bool {
+        let kind = ReferenceCardResolver.resolve(item: item, metadata: store.sourceMetadata(for: item)).kind
+        return kind == .instagram || kind == .xPost
+    }
+
+    private var supportsHeroMorph: Bool {
+        isImage || (isSocialReference && item.thumbnailPath != nil)
+    }
+
     var body: some View {
         GeometryReader { proxy in
             let layout = focusStageLayout(for: proxy.size)
 
             ZStack {
-                Color.black.opacity(isDismissing ? 0.16 : (chromeVisible ? 0.46 : 0.28))
+                Color.black.opacity(backdropVisible ? 0.46 : 0)
                     .contentShape(Rectangle())
                     .onTapGesture {
                         dismissFocus()
                     }
-                    .animation(AppMotion.chromeReveal, value: chromeVisible)
+                    .animation(isDismissing ? AppMotion.referenceClose : AppMotion.referenceOpen, value: backdropVisible)
 
-                VStack(spacing: 0) {
-                    HStack {
+                HStack(spacing: 0) {
+                    VStack(spacing: 0) {
+                        HStack {
                         VStack(alignment: .leading, spacing: 2) {
                             Text(item.title)
                                 .font(LociFont.headline)
@@ -668,21 +700,6 @@ struct InlineFocusStage: View {
                         }
 
                         Spacer()
-
-                        Button {
-                            withAnimation(AppMotion.quick) {
-                                showsDetails.toggle()
-                            }
-                        } label: {
-                            Image(systemName: showsDetails ? "info.circle.fill" : "info.circle")
-                                .font(LociFont.headline)
-                                .foregroundStyle(.white.opacity(showsDetails ? 0.92 : 0.72))
-                                .frame(width: 28, height: 28)
-                                .background(Color.white.opacity(showsDetails ? 0.16 : 0.10), in: Circle())
-                        }
-                        .buttonStyle(.plain)
-                        .help(showsDetails ? "Hide details" : "Show details")
-                        .accessibilityLabel(showsDetails ? "Hide details" : "Show info")
 
                         Button {
                             dismissFocus()
@@ -706,50 +723,39 @@ struct InlineFocusStage: View {
                     .allowsHitTesting(chromeVisible)
                     .animation(AppMotion.chromeReveal, value: chromeVisible)
 
-                    // The preview and inspector use separate layout lanes so metadata never covers the file.
                     ZStack {
                         previewContent
                             .frame(width: layout.previewWidth, height: layout.previewHeight)
                             .scaleEffect(previewScale)
                             .opacity(previewOpacity)
                             .transition(.opacity)
-                            .animation(AppMotion.hero, value: previewVisible)
-                            .animation(AppMotion.closeHero, value: isDismissing)
+                            .animation(isDismissing ? AppMotion.referenceClose : AppMotion.referenceOpen, value: previewVisible)
                     }
-                    .frame(width: proxy.size.width, height: layout.previewLaneHeight)
+                    .frame(width: layout.mediaWidth, height: layout.previewLaneHeight)
                     .clipped()
-
-                    if showsDetails {
-                        FocusMetadataPanel(
-                            item: item,
-                            collectionName: item.collectionID.flatMap { id in
-                                store.collections.first(where: { $0.id == id })?.name
-                            } ?? "Inbox"
-                        )
-                        .frame(width: layout.inspectorWidth, height: layout.inspectorHeight)
-                        .padding(.horizontal, 24)
-                        .padding(.top, layout.inspectorTopSpacing)
-                        .padding(.bottom, layout.bottomPadding)
-                        .transition(.move(edge: .bottom).combined(with: .opacity))
-                    } else {
-                        Color.clear
-                            .frame(height: layout.bottomPadding)
                     }
+                    .frame(width: layout.mediaWidth, height: proxy.size.height)
+                    .background(Color(red: 0.045, green: 0.045, blue: 0.048))
+
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .animation(AppMotion.quick, value: showsDetails)
 
                 HStack {
                     focusNavigationButton(systemName: "chevron.left", offset: -1)
                     Spacer()
                     focusNavigationButton(systemName: "chevron.right", offset: 1)
                 }
-                .frame(maxWidth: .infinity)
-                .padding(.horizontal, max(24, proxy.size.width * 0.045))
+                .frame(width: layout.mediaWidth - 32)
+                .position(x: layout.mediaWidth / 2, y: proxy.size.height / 2)
                 .opacity(chromeVisible ? 1 : 0)
                 .scaleEffect(chromeVisible ? 1 : 0.96)
                 .allowsHitTesting(chromeVisible)
                 .animation(AppMotion.chromeReveal, value: chromeVisible)
+
+                if heroVisible, let sourceFrame = capturedSourceFrame {
+                    previewHero(from: sourceFrame, layout: layout, in: proxy.size)
+                        .zIndex(3)
+                }
 
             }
             .accessibilityAction(.escape) {
@@ -758,14 +764,49 @@ struct InlineFocusStage: View {
         }
         .id(item.id)
         .allowsHitTesting(!isDismissing)
-        .task(id: item.id) {
+        .task(id: PresentationTaskID(itemID: item.id, hasSourceFrame: sourceFrame != nil)) {
+            if presentationHasCommitted {
+                if let sourceFrame, !heroVisible, !isDismissing {
+                    capturedSourceFrame = sourceFrame
+                }
+                return
+            }
+
+            presentationHasCommitted = true
+            let shouldMorph = supportsHeroMorph && sourceFrame != nil && !AppMotion.reduceMotion
             isDismissing = false
             previewVisible = false
+            backdropVisible = false
             chromeVisible = false
-            withAnimation(AppMotion.hero) {
-                previewVisible = true
+            capturedSourceFrame = sourceFrame
+            heroVisible = shouldMorph
+            heroExpanded = false
+
+            if shouldMorph {
+                withAnimation(AppMotion.referenceOpen) {
+                    backdropVisible = true
+                }
+                await Task.yield()
+                guard !Task.isCancelled, !isDismissing else { return }
+                withAnimation(AppMotion.referenceOpen) {
+                    heroExpanded = true
+                }
+                // Do not crossfade until the traveling surface has reached the
+                // exact preview bounds. Revealing the final preview early is what
+                // reads as a snap at the end of a supposedly continuous motion.
+                try? await Task.sleep(nanoseconds: AppMotion.reduceMotion ? 0 : 95_000_000)
+                guard !Task.isCancelled, !isDismissing else { return }
+                withAnimation(.easeOut(duration: 0.09)) {
+                    previewVisible = true
+                    heroVisible = false
+                }
+            } else {
+                withAnimation(AppMotion.referenceOpen) {
+                    backdropVisible = true
+                    previewVisible = true
+                }
             }
-            try? await Task.sleep(nanoseconds: 70_000_000)
+            try? await Task.sleep(nanoseconds: AppMotion.referenceChromeDelayNanoseconds)
             guard !Task.isCancelled else { return }
             withAnimation(AppMotion.chromeReveal) {
                 chromeVisible = true
@@ -773,30 +814,71 @@ struct InlineFocusStage: View {
         }
         .onChange(of: item.id) { _, _ in
             pageIndex = 0
-            showsDetails = false
+            presentationHasCommitted = false
+        }
+        .onChange(of: sourceFrame) { _, newFrame in
+            guard let newFrame, presentationHasCommitted, !heroVisible, !isDismissing else { return }
+            capturedSourceFrame = newFrame
         }
         .onChange(of: store.focusDismissalRequestID) { _, _ in
             dismissFocus()
+        }
+        .onDisappear {
+            dismissalTask?.cancel()
+            dismissalTask = nil
         }
     }
 
     private func dismissFocus() {
         guard !isDismissing else { return }
         store.focusIsDismissing = true
+        let dismissedItemID = item.id
+        let shouldReverseMorph = capturedSourceFrame != nil && supportsHeroMorph && !AppMotion.reduceMotion
 
-        withAnimation(AppMotion.closeHero) {
+        // Keep the hero at its destination for one render pass before asking it to
+        // travel home. Mutating visibility and scale in one transaction makes the
+        // reverse transition appear to pop instead of shrink into the grid tile.
+        var setupTransaction = Transaction()
+        setupTransaction.disablesAnimations = true
+        withTransaction(setupTransaction) {
             isDismissing = true
             chromeVisible = false
-            showsDetails = false
             previewVisible = false
+            if shouldReverseMorph {
+                heroVisible = true
+                heroExpanded = true
+            }
         }
 
-        Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 105_000_000)
-            guard isDismissing else { return }
-            withAnimation(AppMotion.closeHero) {
-                store.clearFocus()
+        dismissalTask?.cancel()
+        dismissalTask = Task { @MainActor in
+            if shouldReverseMorph {
+                await Task.yield()
+                guard !Task.isCancelled,
+                      isDismissing,
+                      store.focusedItemID == dismissedItemID else { return }
+                withAnimation(AppMotion.referenceClose) {
+                    heroExpanded = false
+                }
+                try? await Task.sleep(nanoseconds: AppMotion.referenceCloseDelayNanoseconds)
+            } else {
+                withAnimation(AppMotion.referenceClose) {
+                    backdropVisible = false
+                }
+                try? await Task.sleep(nanoseconds: AppMotion.referenceCloseDelayNanoseconds)
             }
+            guard !Task.isCancelled,
+                  isDismissing,
+                  store.focusedItemID == dismissedItemID else { return }
+            withAnimation(AppMotion.referenceClose) {
+                backdropVisible = false
+            }
+            try? await Task.sleep(nanoseconds: 15_000_000)
+            guard !Task.isCancelled,
+                  isDismissing,
+                  store.focusedItemID == dismissedItemID else { return }
+            store.clearFocus()
+            dismissalTask = nil
         }
     }
 
@@ -804,30 +886,97 @@ struct InlineFocusStage: View {
         if previewVisible {
             return 1
         }
-        return isDismissing ? 0.97 : 0.945
+        return isDismissing ? 0.985 : 0.972
     }
 
     private var previewOpacity: Double {
         if previewVisible {
             return 1
         }
-        return isDismissing ? 0.26 : 0.96
+        return 0
+    }
+
+    @ViewBuilder
+    private func previewHero(from source: CGRect, layout: FocusStageLayout, in size: CGSize) -> some View {
+        let sourceImage = fittedImageRect(in: source)
+        let target = previewImageRect(layout: layout, in: size)
+        // Both rects share the image aspect ratio. One scale keeps the bitmap,
+        // rounded corners, and shadow physically coherent throughout the move.
+        let scale = max(0.01, target.width / max(sourceImage.width, 1))
+        let offset = CGSize(width: target.midX - sourceImage.midX, height: target.midY - sourceImage.midY)
+
+        ReferenceThumbnail(item: item, sourceMetadata: store.sourceMetadata(for: item))
+            .frame(width: sourceImage.width, height: sourceImage.height)
+            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .shadow(color: .black.opacity(0.12), radius: heroExpanded ? 12 : 5, y: heroExpanded ? 4 : 2)
+            .scaleEffect(heroExpanded ? scale : 1, anchor: .center)
+            .position(x: sourceImage.midX, y: sourceImage.midY)
+            .offset(heroExpanded ? offset : .zero)
+            .allowsHitTesting(false)
+            .animation(isDismissing ? AppMotion.referenceClose : AppMotion.referenceOpen, value: heroExpanded)
+    }
+
+    private func fittedImageRect(in source: CGRect) -> CGRect {
+        // This is deliberately the same ratio used by CleanImagePreview below.
+        // A cached thumbnail can have a slightly different crop from the original;
+        // using the preview's ratio prevents a final-frame jump during the crossfade.
+        let imageAspectRatio = max(0.1, item.aspectRatio)
+        let heightFromWidth = source.width / imageAspectRatio
+        if heightFromWidth <= source.height {
+            return CGRect(
+                x: source.minX,
+                y: source.midY - heightFromWidth / 2,
+                width: source.width,
+                height: heightFromWidth
+            )
+        }
+
+        let widthFromHeight = source.height * imageAspectRatio
+        return CGRect(
+            x: source.midX - widthFromHeight / 2,
+            y: source.minY,
+            width: widthFromHeight,
+            height: source.height
+        )
+    }
+
+    private func previewImageRect(layout: FocusStageLayout, in size: CGSize) -> CGRect {
+        let container = CGRect(
+            x: (layout.mediaWidth - layout.previewWidth) / 2,
+            y: layout.headerHeight + (layout.previewLaneHeight - layout.previewHeight) / 2,
+            width: layout.previewWidth,
+            height: layout.previewHeight
+        )
+        let aspectRatio = max(0.1, item.aspectRatio)
+        let heightFromWidth = container.width / aspectRatio
+        if heightFromWidth <= container.height {
+            return CGRect(
+                x: container.minX,
+                y: container.midY - heightFromWidth / 2,
+                width: container.width,
+                height: heightFromWidth
+            )
+        }
+        let widthFromHeight = container.height * aspectRatio
+        return CGRect(
+            x: container.midX - widthFromHeight / 2,
+            y: container.minY,
+            width: widthFromHeight,
+            height: container.height
+        )
     }
 
     private struct FocusStageLayout {
         var headerHeight: CGFloat
         var previewLaneHeight: CGFloat
+        var mediaWidth: CGFloat
         var previewWidth: CGFloat
         var previewHeight: CGFloat
-        var inspectorWidth: CGFloat
-        var inspectorHeight: CGFloat
-        var inspectorTopSpacing: CGFloat
-        var bottomPadding: CGFloat
     }
 
     @ViewBuilder
     private var previewContent: some View {
-        if isImage {
+        if isImage || isSocialReference {
             CleanImagePreview(item: item, store: store)
         } else if isWebsite {
             CleanWebsitePreview(item: item, store: store)
@@ -842,24 +991,21 @@ struct InlineFocusStage: View {
 
     private func focusStageLayout(for size: CGSize) -> FocusStageLayout {
         let headerHeight: CGFloat = 66
-        let bottomPadding: CGFloat = showsDetails ? 14 : 20
-        let inspectorTopSpacing: CGFloat = showsDetails ? 12 : 0
-        let inspectorHeight: CGFloat = showsDetails ? min(max(size.height * 0.10, 68), 82) : 0
-        let reservedHeight = headerHeight + inspectorTopSpacing + inspectorHeight + bottomPadding
-        let previewLaneHeight = max(160, size.height - reservedHeight)
-        let previewWidth = min(size.width * 0.88, 1160)
-        let previewHeight = min(previewLaneHeight, size.height * (showsDetails ? 0.66 : 0.82))
-        let inspectorWidth = min(max(720, size.width - 72), 1120)
+        let mediaWidth = size.width
+        let previewLaneHeight = max(160, size.height - headerHeight)
+        let horizontalMargin = min(max(mediaWidth * 0.075, 44), 104)
+        let verticalMargin = min(max(previewLaneHeight * 0.065, 28), 64)
+        let availableWidth = max(240, mediaWidth - horizontalMargin * 2)
+        let availableHeight = max(160, previewLaneHeight - verticalMargin * 2)
+        let previewWidth = min(availableWidth, 1_180)
+        let previewHeight = min(availableHeight, 860)
 
         return FocusStageLayout(
             headerHeight: headerHeight,
             previewLaneHeight: previewLaneHeight,
+            mediaWidth: mediaWidth,
             previewWidth: previewWidth,
-            previewHeight: previewHeight,
-            inspectorWidth: inspectorWidth,
-            inspectorHeight: inspectorHeight,
-            inspectorTopSpacing: inspectorTopSpacing,
-            bottomPadding: bottomPadding
+            previewHeight: previewHeight
         )
     }
 
@@ -886,12 +1032,205 @@ struct InlineFocusStage: View {
     }
 }
 
-private struct FocusMetadataPanel: View {
+private struct ReferenceDossierPanel: View {
     var item: ReferenceItem
+    var metadata: ReferenceSourceMetadata?
     var collectionName: String
+    var relatedItems: [ReferenceItem]
+    var onSelectRelated: (ReferenceItem) -> Void
+
+    private var presentation: ReferenceCardPresentation {
+        ReferenceCardResolver.resolve(item: item, metadata: metadata)
+    }
 
     var body: some View {
-        HStack(alignment: .center, spacing: 12) {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 0) {
+                HStack {
+                    Text("REFERENCE DOSSIER")
+                        .font(.system(size: 9, weight: .semibold))
+                        .tracking(1.15)
+                        .foregroundStyle(.white.opacity(0.36))
+                    Spacer()
+                    Text(presentation.badge)
+                        .font(.system(size: 8, weight: .bold))
+                        .foregroundStyle(.white.opacity(0.58))
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 4)
+                        .overlay {
+                            Capsule().strokeBorder(.white.opacity(0.12), lineWidth: 0.8)
+                        }
+                }
+                .padding(.bottom, 24)
+
+                Text(item.title)
+                    .font(.system(size: 23, weight: .medium))
+                    .tracking(-0.46)
+                    .foregroundStyle(.white.opacity(0.94))
+                    .fixedSize(horizontal: false, vertical: true)
+
+                HStack(spacing: 7) {
+                    Text(attributionLabel)
+                    if let dateLabel {
+                        Circle().fill(.white.opacity(0.24)).frame(width: 3, height: 3)
+                        Text(dateLabel)
+                    }
+                }
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(.white.opacity(0.46))
+                .padding(.top, 8)
+
+                if let bodyText {
+                    Text(bodyText)
+                        .font(.system(size: 12.5, weight: .regular))
+                        .lineSpacing(4)
+                        .foregroundStyle(.white.opacity(0.72))
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.top, 22)
+                }
+
+                dossierDivider.padding(.vertical, 24)
+
+                VStack(spacing: 0) {
+                    DossierMetadataRow(label: "Source", value: presentation.sourceLabel)
+                    DossierMetadataRow(label: "Space", value: collectionName)
+                    DossierMetadataRow(label: "Type", value: fileTypeLabel)
+                    DossierMetadataRow(label: "File", value: item.fileName)
+                    if let urlLabel {
+                        DossierMetadataRow(label: "Origin", value: urlLabel)
+                    }
+                }
+
+                if !relatedItems.isEmpty {
+                    dossierDivider.padding(.vertical, 24)
+
+                    Text("RELATED ELEMENTS")
+                        .font(.system(size: 9, weight: .semibold))
+                        .tracking(1.05)
+                        .foregroundStyle(.white.opacity(0.36))
+                        .padding(.bottom, 12)
+
+                    VStack(spacing: 8) {
+                        ForEach(relatedItems.prefix(6)) { related in
+                            Button {
+                                onSelectRelated(related)
+                            } label: {
+                                HStack(spacing: 11) {
+                                    ReferenceThumbnail(item: related)
+                                        .frame(width: 68, height: 46)
+                                        .clipped()
+
+                                    VStack(alignment: .leading, spacing: 3) {
+                                        Text(related.title)
+                                            .font(.system(size: 11, weight: .medium))
+                                            .foregroundStyle(.white.opacity(0.82))
+                                            .lineLimit(2)
+                                            .multilineTextAlignment(.leading)
+                                        Text(related.group.rawValue)
+                                            .font(.system(size: 9, weight: .medium))
+                                            .foregroundStyle(.white.opacity(0.34))
+                                    }
+                                    Spacer(minLength: 0)
+                                    Image(systemName: "chevron.right")
+                                        .font(.system(size: 9, weight: .semibold))
+                                        .foregroundStyle(.white.opacity(0.25))
+                                }
+                                .padding(7)
+                                .background(.white.opacity(0.035))
+                                .overlay {
+                                    Rectangle().strokeBorder(.white.opacity(0.065), lineWidth: 0.7)
+                                }
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+            }
+            .padding(.horizontal, 24)
+            .padding(.top, 24)
+            .padding(.bottom, 32)
+        }
+        .background(Color(red: 0.068, green: 0.068, blue: 0.072))
+    }
+
+    private var dossierDivider: some View {
+        Rectangle().fill(.white.opacity(0.08)).frame(height: 1)
+    }
+
+    private var bodyText: String? {
+        let candidates = item.isXBookmark
+            ? [metadata?.selectedText, metadata?.articleMarkdown]
+            : [metadata?.selectedText, metadata?.articleMarkdown, metadata?.note]
+        return candidates.compactMap(clean).first
+    }
+
+    private var attributionLabel: String {
+        if item.isXBookmark, let author = clean(metadata?.note) { return author }
+        let technicalSources = Set(["extension", "browser-extension", "wiki-compile", "x-bookmark-sync"])
+        if let source = clean(metadata?.source), !technicalSources.contains(source.lowercased()) { return source }
+        return presentation.sourceLabel
+    }
+
+    private var dateLabel: String? {
+        guard let value = metadata?.sourceCreatedAt else { return nil }
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let date = fractional.date(from: value) ?? ISO8601DateFormatter().date(from: value)
+        return date?.formatted(date: .abbreviated, time: .omitted)
+    }
+
+    private var urlLabel: String? {
+        guard let url = metadata?.url.flatMap(URL.init(string:)) ?? item.websiteURL else { return nil }
+        return url.host(percentEncoded: false)?.replacingOccurrences(of: "www.", with: "")
+    }
+
+    private var fileTypeLabel: String {
+        let ext = item.fileExtension.uppercased()
+        return ext.isEmpty ? item.kind.rawValue.capitalized : ext
+    }
+
+    private func clean(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let cleaned = value
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return cleaned.isEmpty ? nil : String(cleaned.prefix(1_200))
+    }
+}
+
+private struct DossierMetadataRow: View {
+    var label: String
+    var value: String
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 12) {
+            Text(label.uppercased())
+                .font(.system(size: 8, weight: .semibold))
+                .tracking(0.7)
+                .foregroundStyle(.white.opacity(0.28))
+                .frame(width: 54, alignment: .leading)
+            Text(value)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(.white.opacity(0.68))
+                .lineLimit(2)
+                .truncationMode(.middle)
+            Spacer(minLength: 0)
+        }
+        .padding(.vertical, 7)
+    }
+}
+
+private struct FocusMetadataPanel: View {
+    var item: ReferenceItem
+    var metadata: ReferenceSourceMetadata?
+    var collectionName: String
+    var relatedItems: [ReferenceItem]
+    var onSelectRelated: (ReferenceItem) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .center, spacing: 12) {
             HStack(spacing: 10) {
                 Image(systemName: item.kindSymbol)
                     .font(LociFont.headline)
@@ -923,10 +1262,35 @@ private struct FocusMetadataPanel: View {
                 .layoutPriority(3)
             FocusMetadataCell(label: "Type", value: fileTypeLabel)
                 .frame(width: 72, alignment: .leading)
-            FocusMetadataCell(label: "Source", value: sourceLabel)
-                .frame(width: 88, alignment: .leading)
+            FocusMetadataCell(label: "Attribution", value: attributionLabel)
+                .frame(width: 120, alignment: .leading)
             FocusMetadataCell(label: "Space", value: collectionName)
                 .frame(width: 116, alignment: .leading)
+            }
+
+            if !relatedItems.isEmpty {
+                Rectangle().fill(LociColor.hairline).frame(height: 1)
+                HStack(spacing: 9) {
+                    Text("Related")
+                        .font(LociFont.caption)
+                        .foregroundStyle(LociColor.inkTertiary)
+                        .frame(width: 52, alignment: .leading)
+
+                    ForEach(relatedItems.prefix(7)) { related in
+                        Button {
+                            onSelectRelated(related)
+                        } label: {
+                            ReferenceThumbnail(item: related)
+                                .frame(width: 54, height: 34)
+                                .clipped()
+                                .overlay { Rectangle().strokeBorder(LociColor.hairline, lineWidth: 0.7) }
+                        }
+                        .buttonStyle(.plain)
+                        .help(related.title)
+                    }
+                    Spacer(minLength: 0)
+                }
+            }
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
@@ -950,6 +1314,14 @@ private struct FocusMetadataPanel: View {
         if item.websiteURL != nil { return "Website" }
         if item.subtitle == "Quick Note" { return "Note" }
         return item.group.rawValue
+    }
+
+    private var attributionLabel: String {
+        let presentation = ReferenceCardResolver.resolve(item: item, metadata: metadata)
+        if item.isXBookmark, let author = metadata?.note, !author.isEmpty { return author }
+        let technicalSources = Set(["extension", "browser-extension", "wiki-compile", "x-bookmark-sync"])
+        if let source = metadata?.source, !source.isEmpty, !technicalSources.contains(source.lowercased()) { return source }
+        return presentation.sourceLabel
     }
 
     private var headerSubtitle: String {
@@ -1021,43 +1393,32 @@ private struct CleanImagePreview: View {
     @State private var image: NSImage?
 
     var body: some View {
-        ZStack {
-            if let image {
-                GeometryReader { proxy in
-                    let fittedSize = Self.fittedSize(for: image.size, in: proxy.size)
+        GeometryReader { proxy in
+            let fittedSize = Self.fittedSize(for: item.aspectRatio, in: proxy.size)
 
+            ZStack {
+                ReferenceThumbnail(item: item, sourceMetadata: store.sourceMetadata(for: item))
+                    .aspectRatio(item.aspectRatio, contentMode: .fit)
+                    .opacity(image == nil ? 1 : 0)
+
+                if let image {
                     Image(nsImage: image)
                         .resizable()
                         .aspectRatio(contentMode: .fit)
-                        .frame(width: fittedSize.width, height: fittedSize.height)
-                        .background(LociColor.surface, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-                        .overlay {
-                            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                                .strokeBorder(LociColor.hairline, lineWidth: 1)
-                        }
-                        .shadow(color: .black.opacity(0.28), radius: 28, y: 14)
-                        .position(x: proxy.size.width / 2, y: proxy.size.height / 2)
+                        .transition(.opacity)
                 }
-            } else {
-                ReferenceThumbnail(item: item, xBookmarkPayload: store.xBookmarkPayload(for: item))
-                    .aspectRatio(item.aspectRatio, contentMode: .fit)
-                    .frame(maxWidth: 220, maxHeight: 180)
-                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-                    .background(LociColor.surface, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 12, style: .continuous)
-                            .strokeBorder(LociColor.hairline, lineWidth: 1)
-                    }
-                    .overlay {
-                        ProgressView()
-                            .controlSize(.small)
-                            .padding(10)
-                            .background(Color.white.opacity(0.92), in: Circle())
-                    }
-                    .shadow(color: .black.opacity(0.16), radius: 18, y: 8)
             }
+            .frame(width: fittedSize.width, height: fittedSize.height)
+            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .background(LociColor.surface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .strokeBorder(LociColor.hairline, lineWidth: 1)
+            }
+            .shadow(color: .black.opacity(0.12), radius: 12, y: 4)
+            .position(x: proxy.size.width / 2, y: proxy.size.height / 2)
+            .animation(.easeOut(duration: 0.12), value: image != nil)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .task(id: item.id) {
             guard let url = store.originalFileURL(for: item) else { return }
             image = await Self.loadImage(from: url)
@@ -1072,13 +1433,13 @@ private struct CleanImagePreview: View {
         await LociImageLoader.downsampledImage(from: url, maxPixelSize: 2400)
     }
 
-    private static func fittedSize(for imageSize: CGSize, in containerSize: CGSize) -> CGSize {
-        let imageWidth = max(imageSize.width, 1)
-        let imageHeight = max(imageSize.height, 1)
-        let widthScale = containerSize.width / imageWidth
-        let heightScale = containerSize.height / imageHeight
-        let scale = min(widthScale, heightScale)
-        return CGSize(width: imageWidth * scale, height: imageHeight * scale)
+    private static func fittedSize(for aspectRatio: CGFloat, in containerSize: CGSize) -> CGSize {
+        let safeRatio = max(0.1, aspectRatio)
+        let widthFromHeight = containerSize.height * safeRatio
+        if widthFromHeight <= containerSize.width {
+            return CGSize(width: widthFromHeight, height: containerSize.height)
+        }
+        return CGSize(width: containerSize.width, height: containerSize.width / safeRatio)
     }
 }
 
@@ -1227,57 +1588,59 @@ struct LociTitle: View {
 
     private var title: String {
         switch store.selectedFilter {
-        case .all: "LOCI LIBRARY"
-        case .inbox: "INBOX"
-        case .xBookmarks: "X BOOKMARKS"
-        case .files: "FILES"
-        case .trash: "TRASH"
-        case .chat: "ASK LOCI"
-        case .api: "CREATIVE MEMORY"
-        case .graph: "GRAPH"
-        case .timeline: "TIMELINE"
-        case .review: "REVIEW"
-        case .capabilities: "CAPABILITIES"
-        case .patterns: "PATTERNS"
-        case .rules: "RULES"
+        case .all: "Library"
+        case .inbox: "Inbox"
+        case .xBookmarks: "X Bookmarks"
+        case .files: "Files"
+        case .trash: "Trash"
+        case .chat: "Ask Loci"
+        case .api: "Creative Memory"
+        case .graph: "Graph"
+        case .timeline: "Timeline"
+        case .review: "Review"
+        case .capabilities: "Capabilities"
+        case .patterns: "Patterns"
+        case .rules: "Rules"
         case .collection(let id):
-            store.collections.first(where: { $0.id == id })?.name.uppercased() ?? "COLLECTION"
+            store.collections.first(where: { $0.id == id })?.name ?? "Collection"
         }
     }
 
     var body: some View {
-        VStack(spacing: 4) {
-            if let thread {
-                Text("CREATIVE THREAD")
-                    .font(LociFont.label)
-                    .foregroundStyle(LociColor.inkSecondary)
-                    .tracking(0.3)
-                Text(thread.name)
-                    .font(LociFont.headline)
-                    .foregroundStyle(LociColor.ink)
-                if !thread.brief.isEmpty {
-                    Text(thread.brief)
-                        .font(LociFont.caption)
-                        .foregroundStyle(LociColor.inkTertiary)
-                        .lineLimit(1)
-                        .frame(maxWidth: 360)
-                } else {
-                    Text("Add a brief from the Space menu")
-                        .font(LociFont.caption)
-                        .foregroundStyle(LociColor.inkFaint)
+        VStack(spacing: 6) {
+            Text(title)
+                .lociFont(size: 27, weight: .semibold, relativeTo: .title)
+                .foregroundStyle(LociColor.ink)
+                .lineLimit(1)
+                .minimumScaleFactor(0.82)
+
+            HStack(spacing: 6) {
+                Text("\(store.visibleItems.count.formatted()) references")
+
+                if thread != nil {
+                    Text("·")
+                    Text("Creative thread")
+                } else if store.selectedFilter == .all {
+                    Text("·")
+                    Text("Local visual memory")
                 }
-            } else {
-                Text(title)
-                    .font(LociFont.label)
+            }
+            .font(LociFont.caption)
+            .foregroundStyle(LociColor.inkTertiary)
+
+            if let brief = thread?.brief, !brief.isEmpty {
+                Text(brief)
+                    .font(LociFont.caption)
                     .foregroundStyle(LociColor.inkSecondary)
-                    .tracking(0.3)
-                Text("\(store.visibleItems.count.formatted()) ITEMS")
-                    .font(LociFont.label)
-                    .foregroundStyle(LociColor.inkFaint)
-                    .tracking(0.2)
+                    .lineLimit(1)
+                    .frame(maxWidth: 420)
+                    .padding(.top, 1)
             }
         }
+        .frame(maxWidth: 520)
         .allowsHitTesting(false)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(title), \(store.visibleItems.count) references")
     }
 
     private var thread: ReferenceCollection? {
@@ -1590,10 +1953,7 @@ struct LociSidebar: View {
         if filter == .chat {
             UserDefaults.standard.set(true, forKey: "LociNotebookInspectorVisible")
         }
-        var transaction = Transaction()
-        transaction.animation = nil
-        transaction.disablesAnimations = true
-        withTransaction(transaction) {
+        withAnimation(AppMotion.collectionChange) {
             store.selectedFilter = filter
         }
     }
@@ -2035,15 +2395,15 @@ struct LibrarySearchField: View {
         }
         .padding(.leading, 10)
         .padding(.trailing, hasQuery ? 6 : 10)
-        .frame(width: 188)
-        .frame(minHeight: 30)
-        .background(LociColor.surface, in: RoundedRectangle(cornerRadius: 15, style: .continuous))
+        .frame(width: 220)
+        .frame(minHeight: 34)
+        .background(LociColor.surface, in: RoundedRectangle(cornerRadius: 17, style: .continuous))
         .overlay {
-            RoundedRectangle(cornerRadius: 15, style: .continuous)
+            RoundedRectangle(cornerRadius: 17, style: .continuous)
                 .stroke(isFocused ? LociColor.border : LociColor.hairline, lineWidth: 1)
         }
         .shadow(color: .black.opacity(isFocused ? 0.12 : 0.08), radius: isFocused ? 10 : 6, y: 3)
-        .contentShape(RoundedRectangle(cornerRadius: 15, style: .continuous))
+        .contentShape(RoundedRectangle(cornerRadius: 17, style: .continuous))
         .onTapGesture {
             isFocused = true
         }

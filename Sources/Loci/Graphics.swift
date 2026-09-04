@@ -12,7 +12,7 @@ final class ThumbnailImageCache: @unchecked Sendable {
 
     init() {
         cache.countLimit = 180
-        cache.totalCostLimit = 48 * 1_024 * 1_024
+        cache.totalCostLimit = 128 * 1_024 * 1_024
     }
 
     func image(forKey key: String) -> NSImage? {
@@ -129,7 +129,7 @@ private struct ThumbnailImageSource: Hashable {
 
 struct ReferenceThumbnail: View {
     var item: ReferenceItem
-    var xBookmarkPayload: XBookmarkPayloadSummary? = nil
+    var sourceMetadata: ReferenceSourceMetadata? = nil
     @State private var image: NSImage?
     @State private var imageKey: String?
     @State private var failedThumbnailPath: String?
@@ -139,17 +139,12 @@ struct ReferenceThumbnail: View {
             if let store = LociPersistentStore.shared {
                 let sources = Self.imageSources(for: item, store: store)
                 let displayImage = Self.displayImage(for: sources, image: image, imageKey: imageKey)
-                if let displayImage {
-                    if item.importedPreviewKind == .xLink {
-                        XMediaBookmarkGraphic(item: item, image: displayImage, xBookmarkPayload: xBookmarkPayload)
-                    } else {
-                        Image(nsImage: displayImage)
-                            .resizable()
-                            .aspectRatio(contentMode: .fit)
-                    }
-                } else {
-                    proceduralContent
-                }
+                ReferenceCardRenderer(
+                    item: item,
+                    presentation: ReferenceCardResolver.resolve(item: item, metadata: sourceMetadata),
+                    image: displayImage,
+                    sourceMetadata: sourceMetadata
+                )
                 Color.clear
                     .task(id: sources.map(\.key).joined(separator: "|")) {
                         guard !sources.isEmpty else { return }
@@ -252,14 +247,14 @@ struct ReferenceThumbnail: View {
         if let thumbPath = item.thumbnailPath {
             let thumbURL = store.thumbnailsURL.appendingPathComponent(thumbPath)
             if FileManager.default.fileExists(atPath: thumbURL.path) {
-                sources.append(ThumbnailImageSource(key: "thumb:\(thumbPath)", url: thumbURL, maxPixelSize: 512))
+                sources.append(ThumbnailImageSource(key: "thumb:\(thumbPath)", url: thumbURL, maxPixelSize: 1_200))
             }
         }
 
         if item.canPreviewOriginalImage {
             let originalURL = store.originalsURL.appendingPathComponent(item.fileName)
             if FileManager.default.fileExists(atPath: originalURL.path) {
-                sources.append(ThumbnailImageSource(key: "original:\(item.fileName)", url: originalURL, maxPixelSize: 512))
+                sources.append(ThumbnailImageSource(key: "original:\(item.fileName)", url: originalURL, maxPixelSize: 1_200))
             }
         }
 
@@ -268,9 +263,12 @@ struct ReferenceThumbnail: View {
 
     @ViewBuilder
     private var proceduralContent: some View {
-        ThumbnailBackdrop(item: item)
-
-        ImportedReferenceGraphic(item: item, xBookmarkPayload: xBookmarkPayload)
+        ReferenceCardRenderer(
+            item: item,
+            presentation: ReferenceCardResolver.resolve(item: item, metadata: sourceMetadata),
+            image: nil,
+            sourceMetadata: sourceMetadata
+        )
     }
 }
 

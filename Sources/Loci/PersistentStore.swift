@@ -1294,7 +1294,7 @@ final class LociPersistentStore {
     /// full-content fields (`pageHTML`, `transcriptText`) are stripped here —
     /// nothing reads them from this dictionary; consumers that need full
     /// content decode the raw job payload from the database instead.
-    func loadXBookmarkPayloadsByReferenceID() -> [UUID: XBookmarkPayloadSummary] {
+    func loadReferenceSourceMetadataByReferenceID() -> [UUID: ReferenceSourceMetadata] {
         guard let queue = grdbQueue else { return [:] }
         do {
             return try queue.read { db in
@@ -1305,7 +1305,7 @@ final class LociPersistentStore {
                   AND (source = 'extension' OR source = 'wiki-compile')
                 ORDER BY created_at ASC
                 """)
-                var payloads: [UUID: XBookmarkPayloadSummary] = [:]
+                var payloads: [UUID: ReferenceSourceMetadata] = [:]
                 for row in rows {
                     guard let idText = row["reference_id"] as String?,
                           let id = UUID(uuidString: idText),
@@ -1315,20 +1315,24 @@ final class LociPersistentStore {
                         continue
                     }
 
-                    let isXPayload = payload.source == "x-bookmark-sync"
-                        || payload.url.flatMap(URL.init(string:))?.isXFamilyURL == true
-                    guard isXPayload else { continue }
-                    payloads[id] = XBookmarkPayloadSummary(payload)
+                    payloads[id] = ReferenceSourceMetadata(payload)
                 }
                 return payloads
             }
         } catch {
-            print("GRDB loadXBookmarkPayloadsByReferenceID failed: \(error)")
+            print("GRDB loadReferenceSourceMetadataByReferenceID failed: \(error)")
             return [:]
         }
     }
 
-    /// Cheap change token for the rows backing `loadXBookmarkPayloadsByReferenceID()`;
+    func loadXBookmarkPayloadsByReferenceID() -> [UUID: XBookmarkPayloadSummary] {
+        loadReferenceSourceMetadataByReferenceID().filter { _, metadata in
+            metadata.source == "x-bookmark-sync"
+                || metadata.url.flatMap(URL.init(string:))?.isXFamilyURL == true
+        }
+    }
+
+    /// Cheap change token for the rows backing source metadata loading;
     /// lets callers skip the JSON decode pass when nothing changed.
     func xBookmarkPayloadChangeToken() -> String {
         guard let queue = grdbQueue else { return "" }
